@@ -1,0 +1,9 @@
+# 必需（Python >= 3.8）
+numpy
+opencv-python-headless>=4.8   # 有图形界面需求可换成 opencv-python；已在 4.10 / 5.0 上验证
+
+# 可选：头像被反光盖住等情况下的方向兜底（模型已打包在 pip 包内，离线可用，约 15MB）
+# rapidocr_onnxruntime
+
+# 仅开发自测（生成合成数据）需要
+# pillow

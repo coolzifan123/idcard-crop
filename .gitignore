@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+out/
+wheels/
+# 合成测试数据和评测输出（可用 tools/ 下的脚本重新生成）
+synth*/
+*_fail/
