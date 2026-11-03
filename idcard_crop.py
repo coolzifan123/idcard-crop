@@ -16,8 +16,11 @@
   4. 方向判断：
        人像面 —— YuNet 人脸检测（0.2MB ONNX），人脸在右侧且五官正立 → 正向；
        国徽面 —— 国徽（红色圆形色块）应在左上角；
-       都判断不了时（如头像被反光盖住），可选用 RapidOCR 找"姓名/签发机关"等固定字样的位置兜底（装了才用）。
+       都判断不了时（如头像被反光盖住），可选用 RapidOCR 兜底（装了才用）：只认身份证专属字样
+       （居民身份证 / 公民身份号码…），出现行驶证、驾驶证等其他证件字样时返回 unknown，不会被当成国徽面。
   5. 质量检查：清晰度、反光，供前端提示"请重拍"。
+  6. 证件核验（可选，verify=True）：对每张卡跑一次 OCR，用"专属字样 + 排除字样"确认它确实是身份证的
+     那一面，结论分 verified / rejected / uncertain 三种。输入里可能混有其他证件时必须打开。
 
 依赖：Python>=3.8、numpy、opencv-python 或 opencv-python-headless（>=4.8，5.x 亦可）
 """
@@ -26,10 +29,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from typing import List, Optional, Tuple
 
 import cv2
@@ -56,13 +61,16 @@ class IdCardResult:
     detect_score: float = 0.0             # 定位置信度 0~1
     sharpness: float = 0.0                # 清晰度（拉普拉斯方差，越大越清楚）
     glare_ratio: float = 0.0              # 最大反光块占卡面比例
-    need_confirm: bool = False            # 建议前端展示结果让用户确认（定位置信度偏低 / 方向没把握）
+    need_confirm: bool = False            # 建议前端展示结果让用户确认（定位置信度偏低 / 方向没把握 / 核验不确定）
+    doc_check: str = "unchecked"          # 证件核验（verify=True 时）：verified / rejected / uncertain / unavailable
+    doc_evidence: str = ""                # 核验依据，如"识别到：居民身份证"、"识别到其他证件的字样：号牌号码"
     warnings: List[str] = field(default_factory=list)
     elapsed_ms: float = 0.0
 
     def summary(self) -> dict:
         return {
             "ok": self.ok, "need_confirm": self.need_confirm, "side": self.side, "orient_method": self.orient_method,
+            "doc_check": self.doc_check, "doc_evidence": self.doc_evidence,
             "detect_score": round(self.detect_score, 3),
             "sharpness": round(self.sharpness, 1), "glare_ratio": round(self.glare_ratio, 4),
             "warnings": self.warnings, "elapsed_ms": round(self.elapsed_ms, 1),
@@ -596,61 +604,154 @@ def _emblem_score(card: np.ndarray) -> float:
     return best
 
 
-_TOP_KW = {"姓名": "front", "性别": "front", "民族": "front", "中华人民共和国": "back", "居民身份证": "back"}
-_BOTTOM_KW = {"公民身份号码": "front", "签发机关": "back", "有效期限": "back"}
+# --------------------------------------------------------------------------- 4b. OCR：方向兜底 + 证件核验
+# 通用字样（中华人民共和国、姓名、性别、住址、出生、签发机关、有效期限）在行驶证、驾驶证、护照上也有，
+# 只能当辅助证据。认定身份证只看专属字样：背面"居民身份证"，正面"公民身份号码"/"民族"。
+NON_ID_KEYWORDS = (  # 其他证件特有、身份证上不会出现的字样：命中即判定"不是身份证"
+    "机动车", "行驶证", "驾驶证", "号牌号码", "车辆类型", "车辆识别代号", "发动机号码", "使用性质",
+    "准驾车型", "初次领证", "国籍", "护照", "PASSPORT", "居住证", "通行证", "外国人", "永久居留",
+    "营业执照", "统一社会信用代码", "社会保障", "常住人口", "户主", "军官证", "士兵证", "警官证",
+)
+_TOP_KW = ("居民身份证", "中华人民共和国", "姓名", "性别", "民族")   # 身份证正立时在上半部的字样
+_BOTTOM_KW = ("公民身份号码", "签发机关", "有效期限")                # 在下半部的字样
+_DATE_RANGE = re.compile(r"\d{4}[.．]\d{1,2}[.．]\d{1,2}[-—–~至]+(?:\d{4}[.．]\d{1,2}[.．]\d{1,2}|长期)")
+_ID_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
 
 
-def _ocr_orientation(card: np.ndarray) -> Optional[Tuple[bool, str]]:
-    """可选兜底：RapidOCR 找卡面固定字样的位置。正立时"姓名/中华人民共和国"在上，
-    "公民身份号码/签发机关/有效期限"在下。返回 (是否正立, 面别)；未安装或没认出关键字返回 None。"""
+def find_id_numbers(text: str) -> List[str]:
+    """文本里校验位和出生日期都合法的 18 位公民身份号码（GB 11643）。"""
+    out = []
+    for m in re.finditer(r"(?<![0-9X])([1-9]\d{16}[0-9X])(?![0-9X])", text.replace("x", "X").replace("×", "X")):
+        s = m.group(1)
+        if "10X98765432"[sum(int(c) * w for c, w in zip(s, _ID_WEIGHTS)) % 11] != s[17]:
+            continue
+        try:
+            date(int(s[6:10]), int(s[10:12]), int(s[12:14]))
+        except ValueError:
+            continue
+        out.append(s)
+    return out
+
+
+def _lcs_len(a: str, b: str) -> int:
+    dp = [0] * (len(b) + 1)
+    for ca in a:
+        prev = 0
+        for j, cb in enumerate(b):
+            cur = dp[j + 1]
+            dp[j + 1] = prev + 1 if ca == cb else max(dp[j + 1], dp[j])
+            prev = cur
+    return dp[-1]
+
+
+def _fuzzy_has(text: str, kw: str) -> bool:
+    """≥5 字的关键词允许 OCR 错/漏 1 个字；短词必须原样出现（短词模糊匹配容易撞上别的词，如"发证机关"）。"""
+    if kw in text:
+        return True
+    n = len(kw)
+    return n >= 5 and any(_lcs_len(text[i:i + n + 1], kw) >= n - 1 for i in range(len(text)))
+
+
+def check_document(text: str, side: str = "unknown") -> Tuple[str, str, str]:
+    """根据卡面 OCR 全文核验是不是身份证。side 为已判定的面：front / back / unknown（unknown 时由文字决定）。
+    返回 (结论, 面, 依据)：
+      rejected  —— 出现其他证件特有的字样（行驶证、驾驶证、护照、居住证……），或号码属于港澳台居民居住证（81/82/83 开头）；
+      verified  —— 出现该面的身份证专属字样：
+                   背面："居民身份证"（允许错 1 字），或"签发机关"+"有效期限"+日期 同时出现（标题被反光盖住时）；
+                   正面："公民身份号码"（允许错 1 字），或"民族"+校验通过的 18 位号码；
+      uncertain —— 两者都没有，或字样与已判定的面矛盾，应转人工复核。"""
+    neg = [k for k in NON_ID_KEYWORDS if k in text]
+    nums = find_id_numbers(text)
+    if any(n[:2] in ("81", "82", "83") for n in nums):
+        neg.append("港澳台居民居住证号码")
+    if neg:
+        return "rejected", side, "识别到其他证件的字样：" + "、".join(neg)
+    front_hit, back_hit = [], []
+    if _fuzzy_has(text, "公民身份号码"):
+        front_hit.append("公民身份号码")
+    elif "民族" in text and nums:
+        front_hit.append("民族+校验通过的号码")
+    if _fuzzy_has(text, "居民身份证"):
+        back_hit.append("居民身份证")
+    elif "签发机关" in text and "有效期限" in text and _DATE_RANGE.search(text):
+        back_hit.append("签发机关+有效期限+日期")
+    if side not in ("front", "back"):
+        if bool(front_hit) == bool(back_hit):
+            return "uncertain", "unknown", "正反面的字样同时出现" if front_hit else "未识别到身份证专属字样"
+        side = "front" if front_hit else "back"
+    hit, other = (front_hit, back_hit) if side == "front" else (back_hit, front_hit)
+    name = "正面" if side == "front" else "背面"
+    if hit and not other:
+        return "verified", side, "识别到：" + "、".join(hit)
+    if hit:
+        return "uncertain", side, "正反面的字样同时出现"
+    if other:
+        return "uncertain", side, "文字像身份证%s，与判定的%s不一致" % ("背面" if side == "front" else "正面", name)
+    weak = "（只认出了校验通过的身份证号码）" if side == "front" and nums else ""
+    return "uncertain", side, "未识别到身份证%s的专属字样%s" % (name, weak)
+
+
+def _ocr_lines(card: np.ndarray) -> Optional[List[Tuple[float, str]]]:
+    """RapidOCR（可选依赖，按线程缓存）识别卡面，返回 [(文字行中心 y, 文本)]；未安装或出错返回 None。"""
+    eng = getattr(_tls, "ocr", None)
+    if eng is False:
+        return None
     try:
-        if getattr(_tls, "ocr", None) is None:
+        if eng is None:
             from rapidocr_onnxruntime import RapidOCR  # type: ignore
-            _tls.ocr = RapidOCR()
-        res, _ = _tls.ocr(card)
+            eng = _tls.ocr = RapidOCR()
+        res, _ = eng(card)
+    except ImportError:
+        _tls.ocr = False
+        return None
     except Exception:
         return None
-    h = card.shape[0]
-    top, bottom, votes = [], [], {"front": 0, "back": 0}
-    for box, text, _score in res or []:
-        t = str(text).replace(" ", "")
-        cy = float(np.mean([p[1] for p in box]))
-        for kw, side in _TOP_KW.items():
-            if kw in t:
-                top.append(cy)
-                votes[side] += 1
-        for kw, side in _BOTTOM_KW.items():
-            if kw in t:
-                bottom.append(cy)
-                votes[side] += 1
+    return [(float(np.mean([p[1] for p in box])), str(text).replace(" ", "")) for box, text, _ in (res or [])]
+
+
+def _ocr_text(lines: List[Tuple[float, str]]) -> str:
+    return "|".join(t for _, t in lines)
+
+
+def _ocr_orientation(lines: List[Tuple[float, str]], h: int) -> Tuple[Optional[bool], str]:
+    """OCR 兜底：先用 check_document 确认是身份证、是哪一面（行驶证等不会被当成国徽面），
+    再看固定字样在上半部还是下半部判断正倒。返回 (是否正立 / None, 面别)。"""
+    verdict, side, _ = check_document(_ocr_text(lines), "unknown")
+    if verdict != "verified":
+        return None, "unknown"
+    top = [cy for cy, t in lines if any(k in t for k in _TOP_KW)]
+    bottom = [cy for cy, t in lines if any(k in t for k in _BOTTOM_KW)]
     if top and bottom:
-        upright = np.mean(top) < np.mean(bottom)
-    elif top:
-        upright = np.mean(top) < h / 2
-    elif bottom:
-        upright = np.mean(bottom) > h / 2
-    else:
-        return None
-    return bool(upright), max(votes, key=votes.get)
+        return bool(np.mean(top) < np.mean(bottom)), side
+    if top:
+        return bool(np.mean(top) < h / 2), side
+    if bottom:
+        return bool(np.mean(bottom) > h / 2), side
+    return None, side
+
+
+def _orient(card: np.ndarray, face_model: Optional[str], use_ocr: bool):
+    """返回 (摆正后的图, side, method, 是否转了 180°, OCR 结果或 None)。OCR 结果与朝向无关，可留给核验复用。"""
+    flipped = cv2.rotate(card, cv2.ROTATE_180)
+    if face_model and os.path.exists(face_model):
+        f0, f1 = _face_score(card, face_model), _face_score(flipped, face_model)
+        if max(f0, f1) > 0:
+            return (card, "front", "face", False, None) if f0 >= f1 else (flipped, "front", "face", True, None)
+    e0, e1 = _emblem_score(card), _emblem_score(flipped)
+    if max(e0, e1) > 0:
+        return (card, "back", "emblem", False, None) if e0 >= e1 else (flipped, "back", "emblem", True, None)
+    lines = _ocr_lines(card) if use_ocr else None
+    if lines:
+        upright, side = _ocr_orientation(lines, card.shape[0])
+        if upright is not None:
+            return (card, side, "ocr", False, lines) if upright else (flipped, side, "ocr", True, lines)
+    return card, "unknown", "none", False, lines
 
 
 def orient_card(card: np.ndarray, face_model: Optional[str] = DEFAULT_FACE_MODEL,
                 use_ocr: bool = True) -> Tuple[np.ndarray, str, str, bool]:
     """card 为横版，返回 (摆正后的图, side, method, 是否旋转了 180°)。"""
-    flipped = cv2.rotate(card, cv2.ROTATE_180)
-    if face_model and os.path.exists(face_model):
-        f0, f1 = _face_score(card, face_model), _face_score(flipped, face_model)
-        if max(f0, f1) > 0:
-            return (card, "front", "face", False) if f0 >= f1 else (flipped, "front", "face", True)
-    e0, e1 = _emblem_score(card), _emblem_score(flipped)
-    if max(e0, e1) > 0:
-        return (card, "back", "emblem", False) if e0 >= e1 else (flipped, "back", "emblem", True)
-    if use_ocr:
-        o = _ocr_orientation(card)
-        if o is not None:
-            upright, side = o
-            return (card, side, "ocr", False) if upright else (flipped, side, "ocr", True)
-    return card, "unknown", "none", False
+    return _orient(card, face_model, use_ocr)[:4]
 
 
 # --------------------------------------------------------------------------- 5. 质量检查
@@ -688,13 +789,17 @@ def round_corners(card: np.ndarray, fill=(255, 255, 255)) -> np.ndarray:
 # --------------------------------------------------------------------------- 总入口
 def process_idcard(img: np.ndarray, out_width: int = 1011, expected_side: Optional[str] = None,
                    face_model: Optional[str] = DEFAULT_FACE_MODEL, use_ocr: bool = True,
-                   min_detect_score: float = 0.30, confirm_score: float = 0.45) -> IdCardResult:
+                   min_detect_score: float = 0.30, confirm_score: float = 0.45,
+                   verify: bool = False) -> IdCardResult:
     """
     img              : BGR 图（cv2.imread 读入）
     out_width        : 输出宽度，高度按 85.6:54 计算；1011 ≈ 300dpi 实物尺寸
     expected_side    : 'front' / 'back' / None，前端知道当前在拍哪一面时传入，用于提示拍错面
     min_detect_score : 定位置信度低于它直接判失败（提示重拍）
     confirm_score    : 介于两者之间时照常输出，但 need_confirm=True，建议让用户确认
+    verify           : 对每张卡跑一次 OCR，核验确实是身份证的那一面（需安装 rapidocr_onnxruntime，每张多 0.3~0.5 秒）。
+                       输入里可能混有行驶证、驾驶证、护照等其他证件时必须打开。结论写在 doc_check / doc_evidence：
+                       rejected → ok=False（image 仍保留，便于排查）；uncertain → need_confirm=True，应转人工复核。
     """
     t0 = time.time()
     res = IdCardResult(ok=False)
@@ -711,12 +816,30 @@ def process_idcard(img: np.ndarray, out_width: int = 1011, expected_side: Option
     if _score_quad(q * det.scale, det.feat) < 0.8 * det.score:   # 精修反而变差，回退
         q = det.quad
     card, q_src = warp_card(img, q, out_width, out_h)
-    card, side, method, flipped = orient_card(card, face_model, use_ocr)
+    card, side, method, flipped, lines = _orient(card, face_model, use_ocr or verify)
     if flipped:
         q_src = np.roll(q_src, 2, axis=0)
 
     res.ok, res.image, res.side, res.orient_method, res.quad = True, card, side, method, q_src
     res.sharpness, res.glare_ratio = _quality(card)
+    if verify:
+        if lines is None:
+            lines = _ocr_lines(card)
+        if lines is None:
+            res.doc_check, res.need_confirm = "unavailable", True
+            res.warnings.append("未安装 rapidocr_onnxruntime，无法核验证件类型")
+        else:
+            res.doc_check, text_side, res.doc_evidence = check_document(_ocr_text(lines), side)
+            if res.doc_check == "rejected":   # 不是身份证：后面关于方向、拍错面的提示都没有意义了
+                res.ok = False
+                res.warnings.append("不是身份证（%s）" % res.doc_evidence)
+                res.elapsed_ms = (time.time() - t0) * 1000
+                return res
+            if res.doc_check == "uncertain":
+                res.need_confirm = True
+                res.warnings.append("未能确认是身份证：%s，请人工复核" % res.doc_evidence)
+            elif side == "unknown":
+                res.side = side = text_side
     if det.score < confirm_score:
         res.need_confirm = True
         res.warnings.append("卡片边缘不够清晰，请确认裁剪是否完整（深色纯色背景效果最好）")
@@ -771,6 +894,7 @@ def main(argv=None) -> int:
     ap.add_argument("--side", choices=["front", "back"], help="期望的面（用于拍错面提示）")
     ap.add_argument("--round-corners", action="store_true", help="圆角外背景涂白")
     ap.add_argument("--no-ocr", action="store_true", help="禁用 OCR 兜底")
+    ap.add_argument("--verify", action="store_true", help="用 OCR 核验确实是身份证（需 rapidocr_onnxruntime；混有其他证件时必开）")
     ap.add_argument("--debug", action="store_true", help="额外输出带检测框的对照图")
     args = ap.parse_args(argv)
 
@@ -789,7 +913,7 @@ def main(argv=None) -> int:
             print(json.dumps({"file": f, "ok": False, "warnings": ["无法读取图片"]}, ensure_ascii=False))
             n_fail += 1
             continue
-        res = process_idcard(img, args.width, args.side, use_ocr=not args.no_ocr)
+        res = process_idcard(img, args.width, args.side, use_ocr=not args.no_ocr, verify=args.verify)
         stem = os.path.splitext(os.path.basename(f))[0]
         if res.ok:
             out = round_corners(res.image) if args.round_corners else res.image

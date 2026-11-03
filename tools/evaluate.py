@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 在合成测试集上评测：定位精度、方向正确率、正反面识别、耗时。
-用法: python tools/evaluate.py <数据目录(含 scenes/ 和 labels.json)> [--fail-dir 失败样本输出目录]
+用法: python tools/evaluate.py <数据目录(含 scenes/ 和 labels.json)> [--fail-dir 失败样本输出目录] [--verify]
+--verify 时额外统计证件核验结果（测试集全是身份证：rejected 即误剔除，uncertain 即需人工复核）。
 """
 import argparse
 import json
@@ -25,6 +26,7 @@ def main():
     ap.add_argument("--fail-dir")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--verify", action="store_true", help="同时评测证件核验（需 rapidocr_onnxruntime）")
     args = ap.parse_args()
 
     labels = json.load(open(os.path.join(args.data, "labels.json"), encoding="utf-8"))
@@ -39,7 +41,7 @@ def main():
         gt = np.array(L["corners"], np.float32)
         long_side = max(np.linalg.norm(gt[1] - gt[0]), np.linalg.norm(gt[2] - gt[1]))
         t = time.perf_counter()
-        res = ic.process_idcard(img, use_ocr=not args.no_ocr)
+        res = ic.process_idcard(img, use_ocr=not args.no_ocr, verify=args.verify)
         dt = (time.perf_counter() - t) * 1000
         if res.quad is None:
             err = err_any = float("inf")
@@ -50,7 +52,7 @@ def main():
         r = dict(file=L["file"], side=L["side"], bg=L["bg"], extras=L["extras"], blur=L["blur"],
                  crop_ok=err_any < args.tol, full_ok=err < args.tol, err=err_any,
                  side_ok=res.side == L["side"], method=res.orient_method, ms=dt, warnings=res.warnings,
-                 score=res.detect_score, ok=res.ok)
+                 score=res.detect_score, ok=res.ok, doc=res.doc_check, evidence=res.doc_evidence)
         rows.append(r)
         if args.fail_dir and not r["full_ok"]:
             vis = ic.draw_debug(img, res)
@@ -92,6 +94,18 @@ def main():
     for k in sorted(groups):
         g = groups[k]
         print("%-22s %5d %8s %8s" % (k, len(g), pct([r["crop_ok"] for r in g]), pct([r["full_ok"] for r in g])))
+    if args.verify:
+        good = [r for r in rows if r["full_ok"]]
+        print("\n证件核验（只统计裁剪+方向都正确的 %d 张；测试集全是身份证）：" % len(good))
+        for k, desc in (("verified", "通过"), ("uncertain", "转人工复核"), ("rejected", "误剔除")):
+            sub = [r for r in good if r["doc"] == k]
+            print("  %-9s %-10s %4d  %s" % (k, desc, len(sub), pct([1] * len(sub) + [0] * (len(good) - len(sub)))))
+        for side in ("front", "back"):
+            sub = [r for r in good if r["side"] == side]
+            print("  %s 通过率 %s" % (side, pct([r["doc"] == "verified" for r in sub])))
+        for r in good:
+            if r["doc"] != "verified":
+                print("    %s %s blur=%.1f extras=%s  %s" % (r["file"], r["doc"], r["blur"], r["extras"], r["evidence"]))
     print("\n置信度阈值分析（低于阈值 → 提示重拍）：")
     print("%8s %10s %12s %12s" % ("阈值", "输出比例", "输出中正确率", "错误被拦截"))
     for thr in (0.25, 0.30, 0.35, 0.40, 0.45, 0.50):
